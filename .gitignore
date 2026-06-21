@@ -1,9 +1,3 @@
-# Compiled Java output
-build/
-dist/
-*.class
-*.jar
-
 # Runtime files
 *.log
 *.pid
