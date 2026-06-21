@@ -11,6 +11,10 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -24,6 +28,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -31,6 +36,8 @@ public final class VcpuDashboardApp {
     private static final Pattern VCPU_PATTERN = Pattern.compile("(?i)(\\d+)\\s*vCPU(?:s)?");
     private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
     private final RuntimeConfig runtime = RuntimeConfig.load();
+    private final TraceLog trace = new TraceLog(Path.of(value("VCPU_DASHBOARD_LOG", "vcpu.dashboard.log", "vcpu-dashboard.log")));
+    private final boolean traceOcsBodies = Boolean.parseBoolean(value("TRACE_OCS_RESPONSE_BODIES", "vcpu.dashboard.trace-ocs-bodies", "false"));
     private volatile DashboardSnapshot snapshot = DashboardSnapshot.loading();
     private volatile String vaultToken = "";
     private volatile Instant vaultTokenRefreshAt = Instant.EPOCH;
@@ -48,8 +55,19 @@ public final class VcpuDashboardApp {
         server.createContext("/", app::index);
         server.setExecutor(Executors.newCachedThreadPool());
         server.start();
-        System.out.println("VCPU Dashboard listening on http://localhost:" + port);
+        app.trace.info("STARTUP", "VCPU Dashboard listening on http://0.0.0.0:" + port);
+        app.trace.info("CONFIG", "demoMode=" + app.runtime.demoMode + " vaultUri=" + safeUri(app.runtime.vaultUri)
+                + " namespace=" + blankLabel(app.runtime.namespace) + " secretPath=" + blankLabel(app.runtime.secretPath)
+                + " roleId=" + (app.runtime.roleId.isBlank() ? "<missing>" : "<configured>")
+                + " secretId=" + (app.runtime.secretId.isBlank() ? "<missing>" : "<configured>")
+                + " log=" + app.trace.path.toAbsolutePath() + " traceOcsBodies=" + app.traceOcsBodies);
         app.refreshAsync();
+        long refreshSeconds = Long.parseLong(value("REFRESH_INTERVAL_SECONDS", "vcpu.dashboard.refresh-seconds", "300"));
+        if (refreshSeconds > 0) {
+            Executors.newSingleThreadScheduledExecutor(r -> { Thread t = new Thread(r, "dashboard-scheduler"); t.setDaemon(true); return t; })
+                    .scheduleAtFixedRate(app::refreshAsync, refreshSeconds, refreshSeconds, TimeUnit.SECONDS);
+            app.trace.info("STARTUP", "Automatic inventory refresh scheduled every " + refreshSeconds + " seconds");
+        }
     }
 
     private void index(HttpExchange ex) throws IOException {
@@ -58,7 +76,8 @@ public final class VcpuDashboardApp {
     }
 
     private void healthApi(HttpExchange ex) throws IOException {
-        send(ex, 200, "application/json", "{\"status\":\"UP\",\"dataState\":\"" + esc(snapshot.state) + "\"}");
+        send(ex, 200, "application/json", "{\"status\":\"UP\",\"dataState\":\"" + esc(snapshot.state)
+                + "\",\"message\":\"" + esc(snapshot.message) + "\",\"updatedAt\":\"" + snapshot.updatedAt + "\"}");
     }
 
     private void dashboardApi(HttpExchange ex) throws IOException {
@@ -72,31 +91,47 @@ public final class VcpuDashboardApp {
     }
 
     private synchronized void refreshAsync() {
-        if ("refreshing".equals(snapshot.state)) return;
+        if ("refreshing".equals(snapshot.state)) { trace.info("REFRESH", "Refresh ignored because one is already running"); return; }
         DashboardSnapshot prior = snapshot;
-        snapshot = prior.withState("refreshing", "Refreshing Vault and OCS data…");
+        snapshot = prior.withState("refreshing", "Refreshing Vault and OCS data...");
+        trace.info("REFRESH", "Inventory refresh started; previousState=" + prior.state + " previousAccounts=" + prior.accounts.size());
         Thread refreshThread = new Thread(() -> {
-            try { snapshot = refresh(); }
-            catch (Exception e) { snapshot = prior.withState("error", clean(e)); }
+            try {
+                snapshot = refresh();
+                trace.info("REFRESH", "Inventory refresh completed; state=" + snapshot.state + " accounts=" + snapshot.accounts.size()
+                        + " servers=" + snapshot.accounts.stream().mapToInt(AccountSummary::servers).sum()
+                        + " vcpus=" + snapshot.accounts.stream().mapToInt(AccountSummary::vcpus).sum());
+            } catch (Exception e) {
+                String message = "Inventory refresh failed: " + clean(e);
+                snapshot = new DashboardSnapshot("error", message, Instant.now(), prior.accounts);
+                trace.error("REFRESH", message, e);
+            }
         }, "dashboard-refresh");
         refreshThread.setDaemon(true);
         refreshThread.start();
     }
 
     private DashboardSnapshot refresh() throws Exception {
-        if (runtime.demoMode) return demoSnapshot();
+        if (runtime.demoMode) { trace.info("REFRESH", "DEMO_MODE is enabled; no Vault or OCS calls will be made"); return demoSnapshot(); }
         SecretConfig secret = loadSecret();
+        trace.info("VAULT", "Configuration loaded: accounts=" + secret.accounts.size() + " endpoints=" + secret.endpoints.size()
+                + " oauthUrl=" + safeUri(secret.oauthUrl));
         List<AccountSummary> summaries = new ArrayList<>();
         for (TechnicalAccount account : secret.accounts) {
             try {
+                trace.info("ACCOUNT", "Starting account=" + account.name + " accountId=" + account.accountId);
                 String token = oauthToken(account, secret.oauthUrl);
                 summaries.add(summarizeAccount(account, token, secret.endpoints));
             } catch (Exception e) {
+                trace.error("ACCOUNT", "Account failed name=" + account.name + " error=" + clean(e), e);
                 summaries.add(new AccountSummary(account.name, account.accountId, 0, 0, Map.of(), Map.of(), clean(e)));
             }
         }
         summaries.sort(Comparator.comparing(AccountSummary::name, String.CASE_INSENSITIVE_ORDER));
-        return new DashboardSnapshot("ready", "Live inventory", Instant.now(), summaries);
+        long failures = summaries.stream().filter(a -> !a.error.isBlank()).count();
+        String state = failures == 0 ? "ready" : failures == summaries.size() ? "error" : "partial";
+        String message = failures == 0 ? "Live inventory" : failures + " of " + summaries.size() + " accounts have errors; check vcpu-dashboard.log";
+        return new DashboardSnapshot(state, message, Instant.now(), summaries);
     }
 
     private AccountSummary summarizeAccount(TechnicalAccount account, String token, List<OcsEndpoint> endpoints) {
@@ -105,17 +140,33 @@ public final class VcpuDashboardApp {
         List<String> failures = new ArrayList<>();
         for (OcsEndpoint endpoint : endpoints) {
             try {
+                long started = System.nanoTime();
+                trace.info("OCS REQUEST", "GET " + safeUri(endpoint.serversUrl) + " account=" + account.name
+                        + " region=" + endpoint.region + " Authorization=Bearer [REDACTED]");
                 HttpRequest request = HttpRequest.newBuilder(URI.create(endpoint.serversUrl)).timeout(Duration.ofSeconds(20))
                         .header("Accept", "application/json").header("Authorization", "Bearer " + token).GET().build();
                 HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                trace.info("OCS RESPONSE", "GET " + safeUri(endpoint.serversUrl) + " account=" + account.name
+                        + " region=" + endpoint.region + " status=" + response.statusCode() + " durationMs=" + elapsedMs(started)
+                        + " bodyBytes=" + response.body().getBytes(StandardCharsets.UTF_8).length);
+                if (traceOcsBodies) trace.info("OCS BODY", "account=" + account.name + " region=" + endpoint.region + " body=" + response.body());
+                if (response.statusCode() < 200 || response.statusCode() >= 300)
+                    trace.info("OCS ERROR BODY", "account=" + account.name + " region=" + endpoint.region + " body=" + redactedBody(response.body()));
                 if (response.statusCode() < 200 || response.statusCode() >= 300) throw new IOException("HTTP " + response.statusCode());
                 List<ServerFlavor> servers = parseServers(response.body());
                 int regionVcpus = servers.stream().mapToInt(ServerFlavor::vcpus).sum();
+                trace.info("OCS PARSE", "account=" + account.name + " region=" + endpoint.region + " servers=" + servers.size()
+                        + " vcpus=" + regionVcpus + " flavors=" + flavorSummary(servers));
                 total += regionVcpus; serverCount += servers.size(); regions.merge(endpoint.region, regionVcpus, Integer::sum);
                 for (ServerFlavor server : servers) flavors.merge(server.originalName, server.vcpus, Integer::sum);
-            } catch (Exception e) { failures.add(endpoint.region + ": " + clean(e)); }
+            } catch (Exception e) {
+                failures.add(endpoint.region + ": " + clean(e));
+                trace.error("OCS ERROR", "account=" + account.name + " region=" + endpoint.region + " url=" + safeUri(endpoint.serversUrl)
+                        + " error=" + clean(e), e);
+            }
         }
-        return new AccountSummary(account.name, account.accountId, total, serverCount, regions, flavors, String.join(" · ", failures));
+        trace.info("ACCOUNT", "Completed account=" + account.name + " servers=" + serverCount + " vcpus=" + total + " failures=" + failures.size());
+        return new AccountSummary(account.name, account.accountId, total, serverCount, regions, flavors, String.join(" | ", failures));
     }
 
     @SuppressWarnings("unchecked")
@@ -139,31 +190,53 @@ public final class VcpuDashboardApp {
     }
 
     private String oauthToken(TechnicalAccount account, String url) throws Exception {
-        String scope = account.accountId + ":sgcp:cmaas:read " + account.accountId + ":sgcp:ocs:read";
+        String scope = account.accountId + ":sgcp:cmaas:write_node "
+                + account.accountId + ":sgcp:cmaas:read "
+                + account.accountId + ":sgcp:ocs:read "
+                + account.accountId + ":sgcp:ocs:write";
         String body = "grant_type=client_credentials&scope=" + URLEncoder.encode(scope, StandardCharsets.UTF_8);
         String basic = Base64.getEncoder().encodeToString((account.clientId + ":" + account.clientSecret).getBytes(StandardCharsets.UTF_8));
+        long started = System.nanoTime();
+        trace.info("OAUTH REQUEST", "POST " + safeUri(url) + " account=" + account.name
+                + " accountId=" + account.accountId + " Authorization=Basic [REDACTED] scopes=" + scope);
         HttpRequest request = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(20))
                 .header("Authorization", "Basic " + basic).header("Content-Type", "application/x-www-form-urlencoded")
                 .POST(HttpRequest.BodyPublishers.ofString(body)).build();
         HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        trace.info("OAUTH RESPONSE", "POST " + safeUri(url) + " account=" + account.name + " status=" + response.statusCode()
+                + " durationMs=" + elapsedMs(started) + " bodyBytes=" + response.body().getBytes(StandardCharsets.UTF_8).length);
+        if (response.statusCode() < 200 || response.statusCode() >= 300)
+            trace.info("OAUTH ERROR BODY", "account=" + account.name + " body=" + redactedBody(response.body()));
         if (response.statusCode() < 200 || response.statusCode() >= 300) throw new IOException("OAuth HTTP " + response.statusCode());
         String token = findString(new JsonParser(response.body()).parse(), "access_token");
         if (token.isBlank()) throw new IOException("OAuth response has no access_token");
+        trace.info("OAUTH", "Access token received account=" + account.name + " length=" + token.length() + " value=[REDACTED]");
         return token;
     }
 
     private SecretConfig loadSecret() throws Exception {
-        if (!runtime.complete()) throw new IOException("Vault configuration is incomplete");
+        if (!runtime.complete()) {
+            trace.info("VAULT", "Configuration incomplete: uri=" + !runtime.vaultUri.isBlank() + " path=" + !runtime.secretPath.isBlank()
+                    + " roleId=" + !runtime.roleId.isBlank() + " secretId=" + !runtime.secretId.isBlank());
+            throw new IOException("Vault configuration is incomplete");
+        }
         ensureVaultToken();
         Exception last = null;
         for (String path : vaultPaths(runtime.secretPath)) {
             for (int attempt = 0; attempt < 2; attempt++) {
                 try {
-                    HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(stripSlash(runtime.vaultUri) + path)).timeout(Duration.ofSeconds(15))
+                    long started = System.nanoTime();
+                    String requestUrl = stripSlash(runtime.vaultUri) + path;
+                    trace.info("VAULT REQUEST", "GET " + safeUri(requestUrl) + " attempt=" + (attempt + 1)
+                            + " namespace=" + blankLabel(runtime.namespace) + " X-Vault-Token=[REDACTED]");
+                    HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(requestUrl)).timeout(Duration.ofSeconds(15))
                             .header("X-Vault-Token", vaultToken).GET();
                     if (!runtime.namespace.isBlank()) builder.header("X-Vault-Namespace", runtime.namespace);
                     HttpResponse<String> response = HTTP.send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                    trace.info("VAULT RESPONSE", "GET " + safeUri(requestUrl) + " status=" + response.statusCode()
+                            + " durationMs=" + elapsedMs(started) + " body=[REDACTED: contains credentials]");
                     if ((response.statusCode() == 401 || response.statusCode() == 403) && attempt == 0) {
+                        trace.info("VAULT", "Vault rejected cached token; forcing AppRole login and retrying once");
                         vaultToken = "";
                         ensureVaultToken();
                         continue;
@@ -175,25 +248,39 @@ public final class VcpuDashboardApp {
                     List<OcsEndpoint> endpoints = new ArrayList<>(); collectEndpoints(data, endpoints, new HashSet<>());
                     String oauth = findFirst(data, "cmaas_oauth_token_url", "cmaasOauthTokenUrl", "oauth_token_url", "oauthTokenUrl");
                     if (accounts.isEmpty() || endpoints.isEmpty() || oauth.isBlank()) throw new IOException("Vault secret is missing accounts, OCS endpoints, or OAuth URL");
+                    trace.info("VAULT PARSE", "Secret parsed path=" + path + " accounts=" + accounts.stream().map(TechnicalAccount::name).toList()
+                            + " endpoints=" + endpoints.stream().map(e -> e.region + "=" + safeUri(e.serversUrl)).toList()
+                            + " oauthUrl=" + safeUri(oauth) + " credentials=[REDACTED]");
                     return new SecretConfig(oauth, accounts, endpoints);
-                } catch (Exception e) { last = e; break; }
+                } catch (Exception e) { last = e; trace.error("VAULT ERROR", "Secret read path=" + path + " failed: " + clean(e), e); break; }
             }
         }
         throw new IOException(last == null ? "Vault secret was not found" : clean(last));
     }
 
     private synchronized void ensureVaultToken() throws Exception {
-        if (!vaultToken.isBlank() && Instant.now().isBefore(vaultTokenRefreshAt)) return;
+        if (!vaultToken.isBlank() && Instant.now().isBefore(vaultTokenRefreshAt)) {
+            trace.info("VAULT", "Using cached Vault token; refreshAt=" + vaultTokenRefreshAt + " value=[REDACTED]");
+            return;
+        }
         String body = "{\"role_id\":\"" + esc(runtime.roleId) + "\",\"secret_id\":\"" + esc(runtime.secretId) + "\"}";
-        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(stripSlash(runtime.vaultUri) + "/v1/auth/approle/login"))
+        String loginUrl = stripSlash(runtime.vaultUri) + "/v1/auth/approle/login";
+        long started = System.nanoTime();
+        trace.info("VAULT REQUEST", "POST " + safeUri(loginUrl) + " namespace=" + blankLabel(runtime.namespace)
+                + " role_id=[REDACTED] secret_id=[REDACTED]");
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(loginUrl))
                 .timeout(Duration.ofSeconds(15)).header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(body));
         if (!runtime.namespace.isBlank()) builder.header("X-Vault-Namespace", runtime.namespace);
         HttpResponse<String> response = HTTP.send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        trace.info("VAULT RESPONSE", "POST " + safeUri(loginUrl) + " status=" + response.statusCode()
+                + " durationMs=" + elapsedMs(started) + " body=[REDACTED: contains token]");
         Object parsed = new JsonParser(response.body()).parse();
         vaultToken = findString(parsed, "client_token");
         long lease = findNumber(parsed, "lease_duration");
         if (response.statusCode() < 200 || response.statusCode() >= 300 || vaultToken.isBlank()) throw new IOException("Vault AppRole login HTTP " + response.statusCode());
         vaultTokenRefreshAt = lease > 0 ? Instant.now().plusSeconds(Math.max(1, lease - Math.min(30, lease / 5))) : Instant.now().plusSeconds(300);
+        trace.info("VAULT", "AppRole login successful tokenLength=" + vaultToken.length() + " leaseSeconds=" + lease
+                + " refreshAt=" + vaultTokenRefreshAt + " value=[REDACTED]");
     }
 
     private static void collectAccounts(Object value, String suggested, List<TechnicalAccount> out, Set<String> seen) {
@@ -247,6 +334,28 @@ public final class VcpuDashboardApp {
     private static String string(Object o) { return o == null ? "" : String.valueOf(o).trim(); }
     private static String stripSlash(String s) { return s.replaceFirst("/+$", ""); }
     private static String clean(Throwable e) { String s=e.getMessage(); return (s==null||s.isBlank())?e.getClass().getSimpleName():s; }
+    private static String redactedBody(String body) {
+        if (body == null) return "";
+        String limited = body.length() > 4000 ? body.substring(0, 4000) + "...[truncated]" : body;
+        return limited
+                .replaceAll("(?i)(\"(?:access_token|client_token|client_secret|secret_id|password|token)\"\\s*:\\s*\")[^\"]*(\")", "$1[REDACTED]$2")
+                .replaceAll("(?i)(Authorization\\s*[=:]\\s*)(Basic|Bearer)\\s+[^\\s,}]+", "$1$2 [REDACTED]");
+    }
+    private static long elapsedMs(long startedNanos) { return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos); }
+    private static String blankLabel(String value) { return value == null || value.isBlank() ? "<none>" : value; }
+    private static String safeUri(String value) {
+        if (value == null || value.isBlank()) return "<missing>";
+        try {
+            URI uri = URI.create(value);
+            if (uri.getHost() == null) return value.replaceAll("(?i)(token|secret|password)=[^&]+", "$1=[REDACTED]");
+            return new URI(uri.getScheme(), null, uri.getHost(), uri.getPort(), uri.getPath(), null, null).toString();
+        } catch (Exception e) { return "<invalid-url>"; }
+    }
+    private static String flavorSummary(List<ServerFlavor> servers) {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        for (ServerFlavor server : servers) counts.merge(server.originalName + "=" + server.vcpus + "vCPU", 1, Integer::sum);
+        return counts.toString();
+    }
     private static String esc(String s) { if(s==null)return ""; return s.replace("\\","\\\\").replace("\"","\\\"").replace("\n","\\n").replace("\r","\\r"); }
     private static String value(String env, String property, String fallback) { String e=System.getenv(env); if(e!=null&&!e.isBlank())return e.trim(); String p=System.getProperty(property); return p!=null&&!p.isBlank()?p.trim():fallback; }
     private static void send(HttpExchange ex, int status, String contentType, String body) throws IOException { byte[] b=body.getBytes(StandardCharsets.UTF_8); ex.getResponseHeaders().set("Content-Type",contentType); ex.getResponseHeaders().set("Cache-Control","no-store"); ex.sendResponseHeaders(status,b.length); ex.getResponseBody().write(b); ex.close(); }
@@ -268,6 +377,46 @@ public final class VcpuDashboardApp {
         String toJson(){int total=accounts.stream().mapToInt(AccountSummary::vcpus).sum(),servers=accounts.stream().mapToInt(AccountSummary::servers).sum();return "{\"state\":\""+esc(state)+"\",\"message\":\""+esc(message)+"\",\"updatedAt\":\""+updatedAt+"\",\"totalVcpus\":"+total+",\"totalServers\":"+servers+",\"accounts\":["+accounts.stream().map(AccountSummary::toJson).reduce((a,b)->a+","+b).orElse("")+"]}";}
     }
     private static String mapJson(Map<String,Integer> map){StringBuilder b=new StringBuilder("{");int i=0;for(var e:map.entrySet()){if(i++>0)b.append(',');b.append('"').append(esc(e.getKey())).append("\":").append(e.getValue());}return b.append('}').toString();}
+
+    static final class TraceLog {
+        private static final long MAX_BYTES = 20L * 1024L * 1024L;
+        private static final int BACKUPS = 5;
+        private final Path path;
+
+        TraceLog(Path path) { this.path = path.toAbsolutePath().normalize(); }
+
+        void info(String category, String message) { write("INFO", category, message, null); }
+        void error(String category, String message, Throwable error) { write("ERROR", category, message, error); }
+
+        private synchronized void write(String level, String category, String message, Throwable error) {
+            StringBuilder line = new StringBuilder().append(Instant.now()).append(" [").append(level).append("] [")
+                    .append(category).append("] ").append(message == null ? "" : message);
+            if (error != null) {
+                line.append(System.lineSeparator()).append(error);
+                StackTraceElement[] stack = error.getStackTrace();
+                for (int i = 0; i < Math.min(stack.length, 30); i++) line.append(System.lineSeparator()).append("  at ").append(stack[i]);
+            }
+            String output = line.append(System.lineSeparator()).toString();
+            System.out.print(output);
+            try {
+                Path parent = path.getParent();
+                if (parent != null) Files.createDirectories(parent);
+                rotateIfNeeded(output.getBytes(StandardCharsets.UTF_8).length);
+                Files.writeString(path, output, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            } catch (Exception logError) {
+                System.err.println(Instant.now() + " [ERROR] [LOGGER] Unable to write " + path + ": " + clean(logError));
+            }
+        }
+
+        private void rotateIfNeeded(int incomingBytes) throws IOException {
+            if (!Files.exists(path) || Files.size(path) + incomingBytes <= MAX_BYTES) return;
+            for (int i = BACKUPS; i >= 1; i--) {
+                Path source = i == 1 ? path : path.resolveSibling(path.getFileName() + "." + (i - 1));
+                Path target = path.resolveSibling(path.getFileName() + "." + i);
+                if (Files.exists(source)) Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+    }
 
     static final class JsonParser {
         private final String text; private int index;
@@ -293,7 +442,7 @@ public final class VcpuDashboardApp {
 <script>
 const e=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function rows(obj){return Object.entries(obj||{}).map(([k,v])=>`<div class="row"><span>${esc(k)}</span><b>${v} VCPU</b></div>`).join('')||'<div class="row"><span>No data</span><b>—</b></div>'}
-function render(d){e('#total').textContent=d.totalVcpus.toLocaleString();e('#accounts').textContent=d.accounts.length;e('#servers').textContent=d.totalServers.toLocaleString();let max=Math.max(1,...d.accounts.map(a=>a.vcpus));e('#stamp').innerHTML=(d.state==='refreshing'?'<span class="pulse"></span>':'')+esc(d.message)+' · '+new Date(d.updatedAt).toLocaleString();e('#grid').innerHTML=d.accounts.length?d.accounts.map(a=>`<article class="card"><div class="cardtop"><div><div class="name">${esc(a.name)}</div><div class="id">${esc(a.accountId)}</div></div><div class="vcpu"><b>${a.vcpus.toLocaleString()}</b><span>VCPU total</span></div></div><div class="bar"><i style="width:${a.vcpus/max*100}%"></i></div><div class="rows"><div><div class="section-title">By region · ${a.servers} servers</div>${rows(a.regions)}</div><div><div class="section-title">By flavor</div>${rows(a.flavors)}</div></div>${a.error?`<div class="error">${esc(a.error)}</div>`:''}</article>`).join(''):`<div class="empty">${esc(d.message)}</div>`;}
+function render(d){let waiting=!d.accounts.length&&(d.state==='loading'||d.state==='refreshing');e('#total').textContent=waiting?'—':d.totalVcpus.toLocaleString();e('#accounts').textContent=waiting?'—':d.accounts.length;e('#servers').textContent=waiting?'—':d.totalServers.toLocaleString();let max=Math.max(1,...d.accounts.map(a=>a.vcpus));e('#stamp').innerHTML=((d.state==='refreshing'||d.state==='loading')?'<span class="pulse"></span>':'')+esc(d.message)+' · '+new Date(d.updatedAt).toLocaleString();e('#grid').innerHTML=d.accounts.length?d.accounts.map(a=>`<article class="card"><div class="cardtop"><div><div class="name">${esc(a.name)}</div><div class="id">${esc(a.accountId)}</div></div><div class="vcpu"><b>${a.vcpus.toLocaleString()}</b><span>VCPU total</span></div></div><div class="bar"><i style="width:${a.vcpus/max*100}%"></i></div><div class="rows"><div><div class="section-title">By region · ${a.servers} servers</div>${rows(a.regions)}</div><div><div class="section-title">By flavor</div>${rows(a.flavors)}</div></div>${a.error?`<div class="error">${esc(a.error)}</div>`:''}</article>`).join(''):`<div class="empty">${esc(d.message)}</div>`;}
 async function load(){try{render(await (await fetch('/api/dashboard',{cache:'no-store'})).json())}catch{x='#grid';e(x).innerHTML='<div class="empty">Dashboard API is unavailable.</div>'}}
 e('#refresh').onclick=async()=>{e('#refresh').disabled=true;await fetch('/api/dashboard',{method:'POST'});await load();setTimeout(load,1300);e('#refresh').disabled=false};load();setInterval(load,10000);
 </script></body></html>""";
