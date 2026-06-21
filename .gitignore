@@ -1,0 +1,20 @@
+# Compiled Java output
+build/
+dist/
+*.class
+*.jar
+
+# Runtime files
+*.log
+*.pid
+
+# IDE and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
