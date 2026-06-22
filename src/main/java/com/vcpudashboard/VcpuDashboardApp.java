@@ -190,10 +190,7 @@ public final class VcpuDashboardApp {
     }
 
     private String oauthToken(TechnicalAccount account, String url) throws Exception {
-        String scope = account.accountId + ":sgcp:cmaas:write_node "
-                + account.accountId + ":sgcp:cmaas:read "
-                + account.accountId + ":sgcp:ocs:read "
-                + account.accountId + ":sgcp:ocs:write";
+        String scope = account.accountId + ":sgcp:ocs:read";
         String body = "grant_type=client_credentials&scope=" + URLEncoder.encode(scope, StandardCharsets.UTF_8);
         String basic = Base64.getEncoder().encodeToString((account.clientId + ":" + account.clientSecret).getBytes(StandardCharsets.UTF_8));
         long started = System.nanoTime();

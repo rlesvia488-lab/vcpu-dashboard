@@ -2,6 +2,8 @@
 
 A dependency-free Java 17 dashboard that reads technical accounts and Paris/North OCS endpoints from Vault, requests a CMAAS OAuth token for each account, calls each configured server `/details` URL, and totals VCPU capacity by technical account.
 
+Each OAuth token is requested with the single least-privilege scope `<account_id>:sgcp:ocs:read`.
+
 The OCS parser reads `servers[].flavor.original_name` (for example, `XLarge 8vCPU-16GB`) and extracts the VCPU count. It falls back to `servers[].flavor.vcpus` when a custom flavor name does not contain a VCPU number.
 
 ## Build and test
